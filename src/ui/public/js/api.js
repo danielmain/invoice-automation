@@ -37,22 +37,6 @@ const api = {
     // Vendors
     getVendors: () => fetchApi(createUrl('/vendors')),
 
-    // Credentials
-    getCredentials: () => fetchApi(createUrl('/credentials')),
-
-    saveCredential: (vendorId, credentials) => fetchApi(
-        createUrl(`/credentials/${vendorId}`),
-        {
-            method: 'POST',
-            body: JSON.stringify(credentials),
-        }
-    ),
-
-    deleteCredential: (vendorId) => fetchApi(
-        createUrl(`/credentials/${vendorId}`),
-        { method: 'DELETE' }
-    ),
-
     // Invoices
     getAllInvoices: () => fetchApi(createUrl('/invoices')),
 

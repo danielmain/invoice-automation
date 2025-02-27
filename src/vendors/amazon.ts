@@ -1,9 +1,7 @@
 import fs from 'fs';
 import { Page } from 'playwright';
-import { Credential } from '../services/credential';
 import { InvoiceMetadata } from '../services/storage';
 import { logger } from '../utils/logger';
-import { generateTOTP } from '../utils/totp';
 import * as browserService from '../services/browser';
 import * as storageService from '../services/storage';
 
@@ -11,11 +9,7 @@ import * as storageService from '../services/storage';
 export type VendorConfig = {
     id: string;
     name: string;
-    loginUrl: string;
     invoiceListUrl: string;
-    requiresInteraction?: boolean;
-    authTimeoutMs?: number;
-    downloadTimeoutMs?: number;
 };
 
 export type InvoiceData = {
@@ -30,30 +24,19 @@ export type InvoiceData = {
 export type VendorState = {
     config: VendorConfig;
     page: Page | null;
-    isLoggedIn: boolean;
 };
 
 // Amazon-specific configuration and selectors
 export const amazonConfig: VendorConfig = {
     id: 'amazon',
     name: 'Amazon',
-    loginUrl: 'https://www.amazon.de/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.de%2F%3Fref_%3Dnav_custrec_signin&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=deflex&openid.mode=checkid_setup&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0',
-    invoiceListUrl: 'https://www.amazon.de/-/en/gp/css/order-history?ref_=abn_yadd_ad_your_orders#time/2025/pagination/1/',
-    requiresInteraction: false,
-    authTimeoutMs: 60000,
-    downloadTimeoutMs: 30000,
+    invoiceListUrl: 'https://www.amazon.de/gp/css/order-history?ref_=abn_yadd_ad_your_orders',
 };
 
 const selectors = {
-    loggedInIndicator: '[data-nav-ref="nav_ya_signin"] .nav-line-1-container',
-    username: '#ap_email',
-    password: '#ap_password',
-    continueButton: '#continue',
-    signInButton: '#signInSubmit',
-    captchaContainer: '#auth-captcha-image-container',
     orderHistoryLink: '#nav-orders',
     orderFilter: '#time-filter',
-    orderRows: '#order-card',
+    orderRows: '.order-card',
     invoiceLink: 'a[href*="invoice"]',
     downloadButton: 'input[name="Download"]',
     // Add more specific selectors as needed
@@ -61,145 +44,54 @@ const selectors = {
 
 // Core functions
 export async function initialize(
-    headless = true,
+    headless = false,  // Default to visible browser for system browser integration
     profileName = 'amazon-profile'
 ): Promise<VendorState> {
-    logger.info(`Initializing vendor: ${amazonConfig.name}`);
+    logger.info(`Initializing Amazon vendor with headless=${headless}, profileName=${profileName}`);
 
-    // Create browser context with optional profile
-    await browserService.createBrowserContext({
-        headless,
-        profileName,
-        debugMode: true
-    });
-
-    // Create a new page
-    const page = await browserService.createPage();
-
-    // Add additional event listeners
-    if (page) {
-        page.on('dialog', dialog => {
-            logger.info(`Dialog appeared: ${dialog.type()} - ${dialog.message()}`);
-            dialog.accept();
+    try {
+        // Create browser context with system browser preference
+        logger.info('Creating browser context with system browser preference');
+        const context = await browserService.createBrowserContext({
+            headless,
+            profileName,
+            debugMode: true,
+            useSystemBrowser: true  // Prefer system browser
         });
-    }
 
-    return {
-        config: amazonConfig,
-        page,
-        isLoggedIn: false
-    };
-}
+        // Create a new page
+        logger.info('Creating new page in browser context');
+        const page = await browserService.createPage().catch(err => {
+            logger.error(`Error creating page: ${err instanceof Error ? err.message : String(err)}`);
+            throw err;
+        });
 
-export async function checkIfLoggedIn(page: Page): Promise<boolean> {
-    try {
-        const loggedInElement = await page.$(selectors.loggedInIndicator);
-        const isLoggedIn = !!loggedInElement;
+        logger.info('Browser page created successfully');
 
-        if (isLoggedIn) {
-            const accountText = await loggedInElement.textContent();
-            logger.info(`Already logged in to Amazon as: ${accountText}`);
+        // Add additional event listeners
+        if (page) {
+            logger.info('Adding dialog handler to page');
+            page.on('dialog', dialog => {
+                logger.info(`Dialog appeared: ${dialog.type()} - ${dialog.message()}`);
+                dialog.accept();
+            });
         }
 
-        return isLoggedIn;
+        logger.info('Amazon vendor initialization completed successfully');
+
+        return {
+            config: amazonConfig,
+            page,
+        };
     } catch (error) {
-        logger.error('Error checking Amazon login status', { error });
-        return false;
-    }
-}
-
-export async function performLogin(
-    page: Page,
-    credentials: Credential
-): Promise<boolean> {
-    try {
-        // Enter username
-        await page.waitForSelector(selectors.username);
-        await page.fill(selectors.username, credentials.username);
-        await page.click(selectors.continueButton);
-
-        // Check for CAPTCHA
-        const hasCaptcha = await page.$(selectors.captchaContainer) !== null;
-        if (hasCaptcha) {
-            logger.warn('CAPTCHA detected on Amazon login');
-
-            // Switch to visible mode for user to solve CAPTCHA
-            if (page.context().browser()) {
-                // Take screenshot for debugging
-                await browserService.takeScreenshot(
-                    page,
-                    `amazon-captcha-${Date.now()}.png`
-                );
-
-                // Wait for user to solve CAPTCHA
-                // TODO: Implement notification system to alert user
-
-                logger.info('Waiting for user to solve CAPTCHA (timeout in 5 minutes)');
-                // Wait up to 5 minutes for user to solve
-                await page.waitForNavigation({ timeout: 300000 });
-            }
-        }
-
-        // Enter password (may or may not be visible depending on CAPTCHA flow)
-        try {
-            await page.waitForSelector(selectors.password, { timeout: 3000 });
-            await page.fill(selectors.password, credentials.password);
-            await page.click(selectors.signInButton);
-        } catch (e) {
-            // Password field might not be visible if CAPTCHA was bypassed
-            logger.info('Password field not found, might be already logged in');
-        }
-
-        // Check if login succeeded
-        await page.waitForNavigation();
-        return await checkIfLoggedIn(page);
-    } catch (error) {
-        logger.error('Error during Amazon login process', { error });
-        return false;
-    }
-}
-
-export async function login(
-    state: VendorState,
-    credentials: Credential
-): Promise<VendorState> {
-    if (!state.page) {
-        throw new Error('Browser not initialized');
-    }
-
-    logger.info(`Logging in to ${state.config.name}`);
-
-    try {
-        // Go to login page
-        await state.page.goto(state.config.loginUrl, { waitUntil: 'networkidle' });
-
-        // Check if already logged in
-        const loggedIn = await checkIfLoggedIn(state.page);
-        if (loggedIn) {
-            logger.info(`Already logged in to ${state.config.name}`);
-            return { ...state, isLoggedIn: true };
-        }
-
-        // Perform login
-        const loginSuccess = await performLogin(state.page, credentials);
-
-        if (loginSuccess) {
-            logger.info(`Successfully logged in to ${state.config.name}`);
-            return { ...state, isLoggedIn: true };
-        } else {
-            logger.error(`Failed to log in to ${state.config.name}`);
-            return state;
-        }
-    } catch (error) {
-        logger.error(`Login error for ${state.config.name}`, { error });
-
-        // Take screenshot of the error
-        if (state.page) {
-            const screenshotPath = `logs/screenshots/${state.config.id}-login-error.png`;
-            await browserService.takeScreenshot(state.page, screenshotPath);
-        }
-
-        return state;
+        logger.error('Failed to initialize Amazon vendor', {
+            error,
+            errorType: error instanceof Error ? error.constructor.name : typeof error,
+            errorMessage: error instanceof Error ? error.message : String(error),
+            headless,
+            profileName
+        });
+        throw error;
     }
 }
 
@@ -299,6 +191,14 @@ export async function getInvoiceList(
     const invoices: InvoiceData[] = [];
 
     try {
+        // Select appropriate time filter if fromDate is provided
+        if (fromDate) {
+            await state.page.waitForSelector(selectors.orderFilter);
+            // Select appropriate filter based on date
+            // This is a simplified example, real implementation would be more complex
+            await state.page.selectOption(selectors.orderFilter, { value: 'year-2024' });
+        }
+
         // Get all order rows
         const orderRows = await state.page.$$(selectors.orderRows);
         logger.info(`Found ${orderRows.length} orders on page`);

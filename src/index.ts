@@ -6,9 +6,9 @@ import { config } from './config/config';
 import { logger } from './utils/logger';
 
 // Import services
-import * as credentialService from './services/credential';
 import * as browserService from './services/browser';
 import * as storageService from './services/storage';
+import { runBrowserDiagnostics } from './services/browser-diagnostic';
 
 // Import vendors
 import * as amazonVendor from './vendors/amazon';
@@ -33,10 +33,11 @@ async function initializeServices() {
     logger.info('Initializing services...');
 
     try {
-        // Initialize services in sequence
-        await credentialService.initializeCredentialStore();
-        logger.info('Credential service initialized');
+        // Run browser diagnostics first to identify any issues
+        logger.info('Running browser environment diagnostics');
+        await runBrowserDiagnostics();
 
+        // Initialize services in sequence
         await browserService.initializeBrowser();
         logger.info('Browser service initialized');
 
@@ -45,7 +46,11 @@ async function initializeServices() {
 
         logger.info('All services initialized successfully');
     } catch (error) {
-        logger.error('Failed to initialize services', { error });
+        logger.error('Failed to initialize services', {
+            error,
+            errorType: error instanceof Error ? error.constructor.name : typeof error,
+            errorMessage: error instanceof Error ? error.message : String(error)
+        });
         throw error;
     }
 }
@@ -60,38 +65,21 @@ async function runVendorJob(vendorId: string, options: { limit?: number, fromDat
     appState.currentJobs.set(vendorId, { status: 'running', startedAt: new Date() });
 
     try {
-        // Get vendor credentials
-        const credentials = await credentialService.getCredential(vendorId);
-        if (!credentials) {
-            logger.error(`No credentials found for vendor: ${vendorId}`);
-            appState.currentJobs.set(vendorId, {
-                status: 'failed',
-                error: 'No credentials found',
-                finishedAt: new Date()
-            });
-            return;
-        }
-
         // Initialize vendor-specific handler
         let vendorState;
         let downloadCount = 0;
 
         switch (vendorId) {
             case 'amazon':
-                // Initialize Amazon vendor
-                vendorState = await amazonVendor.initialize(config.browser.headless);
+                // Initialize Amazon vendor - use system browser
+                vendorState = await amazonVendor.initialize(false, 'amazon-profile');
 
-                // Login
-                vendorState = await amazonVendor.login(vendorState, credentials);
-
-                // Download invoices
-                if (vendorState.isLoggedIn) {
-                    downloadCount = await amazonVendor.downloadInvoices(
-                        vendorState,
-                        options.limit,
-                        options.fromDate
-                    );
-                }
+                // Download invoices - we skip login since we're using the user's browser
+                downloadCount = await amazonVendor.downloadInvoices(
+                    vendorState,
+                    options.limit,
+                    options.fromDate
+                );
 
                 // Close session
                 await amazonVendor.close(vendorState);
@@ -134,12 +122,9 @@ async function runVendorJob(vendorId: string, options: { limit?: number, fromDat
 async function runAllVendorJobs(options: { limit?: number, fromDate?: Date } = {}) {
     logger.info('Starting download jobs for all vendors');
 
-    // Get all vendors with credentials
-    const allCredentials = await credentialService.getAllCredentials();
-    const vendorsWithCredentials = Object.keys(allCredentials);
-
-    for (const vendorId of vendorsWithCredentials) {
-        await runVendorJob(vendorId, options);
+    // Run for all supported vendors
+    for (const vendor of SUPPORTED_VENDORS) {
+        await runVendorJob(vendor.id, options);
     }
 
     logger.info('All vendor jobs completed');
@@ -171,55 +156,6 @@ function setupExpressServer() {
         res.json(SUPPORTED_VENDORS);
     });
 
-    // Credentials
-    apiRouter.get('/credentials', async (req, res) => {
-        try {
-            const credentials = await credentialService.getAllCredentials();
-            // Return only vendor IDs and last update timestamps for security
-            const sanitizedCreds = Object.entries(credentials).reduce((acc, [vendorId, cred]) => {
-                acc[vendorId] = {
-                    username: cred.username,
-                    lastUpdated: cred.lastUpdated
-                };
-                return acc;
-            }, {} as Record<string, any>);
-
-            res.json(sanitizedCreds);
-        } catch (error) {
-            logger.error('Error getting credentials', { error });
-            res.status(500).json({ error: 'Failed to get credentials' });
-        }
-    });
-
-    apiRouter.post('/credentials/:vendorId', async (req, res) => {
-        try {
-            const { vendorId } = req.params;
-            const credentials = req.body;
-
-            await credentialService.storeCredential(vendorId, {
-                username: credentials.username,
-                password: credentials.password,
-                additionalFields: credentials.additionalFields
-            });
-
-            res.json({ success: true });
-        } catch (error) {
-            logger.error('Error storing credentials', { error });
-            res.status(500).json({ error: 'Failed to store credentials' });
-        }
-    });
-
-    apiRouter.delete('/credentials/:vendorId', async (req, res) => {
-        try {
-            const { vendorId } = req.params;
-            await credentialService.removeCredential(vendorId);
-            res.json({ success: true });
-        } catch (error) {
-            logger.error('Error removing credentials', { error });
-            res.status(500).json({ error: 'Failed to remove credentials' });
-        }
-    });
-
     // Invoices
     apiRouter.get('/invoices', async (req, res) => {
         try {
@@ -239,6 +175,39 @@ function setupExpressServer() {
         } catch (error) {
             logger.error('Error getting vendor invoices', { error });
             res.status(500).json({ error: 'Failed to get invoices' });
+        }
+    });
+
+    // File download
+    apiRouter.get('/file', async (req, res) => {
+        try {
+            const filePath = req.query.path as string;
+            if (!filePath) {
+                return res.status(400).json({ error: 'Path parameter is required' });
+            }
+
+            // Prevent directory traversal
+            const normalizedPath = path.normalize(filePath);
+            if (normalizedPath.includes('..')) {
+                return res.status(403).json({ error: 'Invalid path' });
+            }
+
+            const buffer = await storageService.getInvoiceFile(filePath);
+
+            // Set content type based on file extension
+            const ext = path.extname(filePath).toLowerCase();
+            if (ext === '.pdf') {
+                res.contentType('application/pdf');
+            } else if (ext === '.html') {
+                res.contentType('text/html');
+            } else {
+                res.contentType('application/octet-stream');
+            }
+
+            res.send(buffer);
+        } catch (error) {
+            logger.error('Error serving file', { error });
+            res.status(404).json({ error: 'File not found' });
         }
     });
 

@@ -13,6 +13,7 @@ export interface AppConfig {
     browser: {
         headless: boolean;
         timeout: number;
+        useSystemBrowser: boolean;
     };
     storage: {
         invoicePath: string;
@@ -42,8 +43,9 @@ export const config: AppConfig = {
     },
     encryptionKey: process.env.ENCRYPTION_KEY || 'default-encryption-key-change-me',
     browser: {
-        headless: getBooleanEnv('HEADLESS', false),
+        headless: getBooleanEnv('HEADLESS', true),
         timeout: getNumberEnv('BROWSER_TIMEOUT', 30000),
+        useSystemBrowser: getBooleanEnv('USE_SYSTEM_BROWSER', true),
     },
     storage: {
         invoicePath: process.env.INVOICE_STORAGE_PATH || path.join(process.cwd(), 'invoices'),
