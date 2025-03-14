@@ -102,10 +102,28 @@ export async function navigateToInvoices(state: VendorState): Promise<boolean> {
 
     try {
         logger.info(`Navigating to invoices page for ${state.config.name}`);
-        await state.page.goto(state.config.invoiceListUrl, { waitUntil: 'networkidle' });
+
+        // Target URL is the order history/invoices page
+        const targetUrl = state.config.invoiceListUrl;
+
+        // Wait for user to login and reach the target URL
+        const isLoggedIn = await browserService.waitForUserLogin(
+            state.page,
+            targetUrl
+        );
+
+        if (!isLoggedIn) {
+            logger.error('Failed to login to Amazon');
+            return false;
+        }
+
+        // At this point we are on the order history page
+        logger.info('Successfully navigated to Amazon order history page');
         return true;
     } catch (error) {
-        logger.error(`Failed to navigate to invoices page for ${state.config.name}`, { error });
+        logger.error(`Failed to navigate to invoices page for ${state.config.name}`, {
+            error: error instanceof Error ? error.message : String(error)
+        });
         return false;
     }
 }
